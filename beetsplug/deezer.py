@@ -1,4 +1,4 @@
-""" . "说明"Adds Deezer release and track search support to the autotagger""" . "说明"
+"""Adds Deezer release and track search support to the autotagger"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from beets import config, ui
 from beets.autotag import AlbumInfo, TrackInfo
 from beets.dbcore import types
 from beets.exceptions import UserError
+from beets.importer.tasks import SINGLE_ARTIST_THRESH
 from beets.metadata_plugins import IDResponse, SearchApiMetadataSourcePlugin
 
 VARIOUS_ARTISTS_ID = 5080
@@ -42,7 +43,7 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         super().__init__()
 
     def commands(self) -> list[ui.Subcommand]:
-        """ . "说明"Add beet UI commands to interact with Deezer.""" . "说明"
+        """Add beet UI commands to interact with Deezer."""
         deezer_update_cmd = ui.Subcommand(
             "deezerupdate", help=f"Update {self.data_source} rank"
         )
@@ -56,7 +57,7 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         return [deezer_update_cmd]
 
     def album_for_id(self, album_id: str) -> AlbumInfo | None:
-        """ . "说明"Fetch an album by its Deezer ID or URL.""" . "说明"
+        """Fetch an album by its Deezer ID or URL."""
         if not (deezer_id := self._extract_id(album_id)):
             return None
 
@@ -69,6 +70,16 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
             artist, artist_id = self.get_artist(contributors)
         else:
             artist, artist_id = None, None
+
+        # The album-level "main" artist. Deezer always sends it for normal
+        # releases, but it may be absent or incomplete on odd responses, so
+        # do not assume the key exists.
+        album_artist_data = album_data.get("artist")
+        album_artist_id = (
+            str(album_artist_data["id"])
+            if album_artist_data and album_artist_data.get("id") is not None
+            else None
+        )
 
         release_date = album_data["release_date"]
         date_parts = [int(part) for part in release_date.split("-")]
@@ -112,20 +123,44 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         for track in tracks:
             track.medium_total = medium_totals[track.medium]
 
-        is_va = str(album_data["artist"]["id"]) == str(VARIOUS_ARTISTS_ID)
+        # Determine whether the release is a compilation ("Various Artists").
+        # Deezer marks ordinary VA releases with its dedicated VA entity, but
+        # some compilations are instead credited to a single "main" artist
+        # (often a label or curator); those slip past the id check. Detect
+        # them from the track-level artists, using the same plurality rule as
+        # the importer: the album artist must perform on at least
+        # `SINGLE_ARTIST_THRESH` of the tracks for the release to count as
+        # theirs. Responses without an album artist cannot be classified and
+        # are left as ordinary releases.
+        if album_artist_id == str(VARIOUS_ARTISTS_ID):
+            is_va = True
+        elif album_artist_id is None:
+            is_va = False
+        else:
+            tracks_with_album_artist = sum(
+                track.artist_id == album_artist_id for track in tracks
+            )
+            is_va = (
+                tracks_with_album_artist < len(tracks) * SINGLE_ARTIST_THRESH
+            )
+
         if is_va:
-            va_name = config["va_name"].as_str()
-            artist = va_name
+            artist = config["va_name"].as_str()
+            artist_credit = artist
+        elif album_artist_data is not None:
+            artist_credit = self.get_artist([album_artist_data])[0]
+        else:
+            # No album-level artist: fall back to whatever the contributors
+            # list (if any) provided, instead of indexing a missing artist.
+            artist_credit = artist
 
         return AlbumInfo(
             album=album_data["title"],
             album_id=deezer_id,
             deezer_album_id=deezer_id,
             artist=artist,
-            artist_credit=(
-                artist if is_va else self.get_artist([album_data["artist"]])[0]
-            ),
-            artist_id=str(artist_id),
+            artist_credit=artist_credit,
+            artist_id=str(artist_id) if artist_id is not None else None,
             tracks=tracks,
             albumtype=album_data["record_type"],
             va=is_va,
@@ -140,13 +175,13 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         )
 
     def track_for_id(self, track_id: str) -> TrackInfo | None:
-        """ . "说明"Fetch a track by its Deezer ID or URL and return a
+        """Fetch a track by its Deezer ID or URL and return a
         TrackInfo object or None if the track is not found.
 
         :param track_id: (Optional) Deezer ID or URL for the track. Either
-            ``track_id`` or ``track_data`` must be provided.
+            ``track_id`` or the ``track_data`` must be provided.
 
-        """ . "说明"
+        """
         if not (deezer_id := self._extract_id(track_id)):
             self._log.debug("Invalid Deezer track_id: {}", track_id)
             return None
@@ -184,10 +219,10 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         return track
 
     def _get_track(self, track_data: JSONDict) -> TrackInfo:
-        """ . "说明"Convert a Deezer track object dict to a TrackInfo object.
+        """Convert a Deezer track object dict to a TrackInfo object.
 
         :param track_data: Deezer Track object dict
-        """ . "说明"
+        """
         contributors = track_data.get("contributors")
         if contributors is None and (artist_data := track_data.get("artist")):
             contributors = [artist_data]
@@ -238,7 +273,7 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         return query, {}
 
     def get_search_response(self, params: SearchParams) -> list[IDResponse]:
-        """ . "说明"Search Deezer and return the raw result payload entries.""" . "说明"
+        """Search Deezer and return the raw result payload entries."""
 
         response = requests.get(
             f"{self.search_url}{params.query_type}",
@@ -253,7 +288,7 @@ class DeezerPlugin(SearchApiMetadataSourcePlugin[IDResponse]):
         return response.json()["data"]
 
     def deezerupdate(self, items: Sequence[Item], write: bool) -> None:
-        """ . "说明"Obtain rank information from Deezer.""" . "说明"
+        """Obtain rank information from Deezer."""
         for index, item in enumerate(items, start=1):
             self._log.info(
                 "Processing {}/{} tracks - {} ", index, len(items), item
